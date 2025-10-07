@@ -56,6 +56,9 @@ else:
 
 cp, has_cp = optional_import("cupy")
 kvikio, has_kvikio = optional_import("kvikio")
+nvimgcodec, has_nvimgcodec = optional_import("nvidia.nvimgcodec")
+
+_nvtx, _ = optional_import("torch._C._nvtx", descriptor="NVTX is not installed. Are you sure you have a CUDA build?")
 
 __all__ = ["ImageReader", "ITKReader", "NibabelReader", "NumpyReader", "PILReader", "PydicomReader", "NrrdReader"]
 
@@ -418,10 +421,12 @@ class PydicomReader(ImageReader):
             If provided, only the matched files will be included. For example, to include the file name
             "image_0001.dcm", the regular expression could be `".*image_(\\d+).dcm"`. Default to `""`.
             Set it to `None` to use `pydicom.misc.is_dicom` to match valid files.
-        to_gpu: If True, load the image into GPU memory using CuPy and Kvikio. This can accelerate data loading.
+        to_gpu: If True, load the image into GPU memory using CuPy and Kvikio, or nvImageCodec (if use_nvimgcodec is True).
+            This can accelerate data loading.
             Default is False. CuPy and Kvikio are required for this option.
             In practical use, it's recommended to add a warm up call before the actual loading.
             A related tutorial will be prepared in the future, and the document will be updated accordingly.
+        use_nvimgcodec: If True, use nvImageCodec to decode the pixel data. Default is True. nvImageCodec is required for this option.
         kwargs: additional args for `pydicom.dcmread` API. more details about available args:
             https://pydicom.github.io/pydicom/stable/reference/generated/pydicom.filereader.dcmread.html
             If the `get_data` function will be called
@@ -439,6 +444,7 @@ class PydicomReader(ImageReader):
         label_dict: dict | None = None,
         fname_regex: str = "",
         to_gpu: bool = False,
+        use_nvimgcodec: bool = True,
         **kwargs,
     ):
         super().__init__()
@@ -449,6 +455,7 @@ class PydicomReader(ImageReader):
         self.prune_metadata = prune_metadata
         self.label_dict = label_dict
         self.fname_regex = fname_regex
+        self.use_nvimgcodec = use_nvimgcodec
         if to_gpu and (not has_cp or not has_kvikio):
             warnings.warn(
                 "PydicomReader: CuPy and/or Kvikio not installed for GPU loading, falling back to CPU loading."
@@ -459,6 +466,10 @@ class PydicomReader(ImageReader):
             self.warmup_kvikio()
 
         self.to_gpu = to_gpu
+
+        if self.use_nvimgcodec:
+            self._nvimgcodec_decoder = nvimgcodec.Decoder()
+            self.decode_params = nvimgcodec.DecodeParams(allow_any_depth=True, color_spec=nvimgcodec.ColorSpec.UNCHANGED)
 
     def warmup_kvikio(self):
         """
@@ -954,6 +965,115 @@ class PydicomReader(ImageReader):
 
         return data
 
+    def _is_nvimgcodec_supported_syntax(self, img):
+        """
+        Check if the DICOM transfer syntax is supported by nvImageCodec.
+        
+        Args:
+            img: a Pydicom dataset object.
+            
+        Returns:
+            bool: True if transfer syntax is supported by nvImageCodec, False otherwise.
+        """
+        if not has_nvimgcodec:
+            return False
+
+        # Check if we have a transfer syntax that nvImageCodec can handle
+        file_meta = getattr(img, 'file_meta', None)
+        if file_meta is None:
+            return False
+        transfer_syntax = file_meta.get('TransferSyntaxUID', None)
+        if not transfer_syntax:
+            return False
+
+        # Define supported transfer syntaxes for nvImageCodec
+        # JPEG 2000 transfer syntaxes
+        jpeg2000_syntaxes = [
+            '1.2.840.10008.1.2.4.90',  # JPEG 2000 Image Compression (Lossless Only)
+            '1.2.840.10008.1.2.4.91',  # JPEG 2000 Image Compression
+        ]
+
+        # HTJ2K (High Throughput JPEG 2000) transfer syntaxes
+        htj2k_syntaxes = [
+            '1.2.840.10008.1.2.4.201',  # HTJ2K Lossless Only
+            '1.2.840.10008.1.2.4.202',  # HTJ2K Lossless with RPCL
+            '1.2.840.10008.1.2.4.203',  # HTJ2K Lossy or Lossless
+        ]
+
+        # JPEG transfer syntaxes
+        jpeg_syntaxes = [
+            '1.2.840.10008.1.2.4.50',  # JPEG Baseline (Process 1)
+            '1.2.840.10008.1.2.4.51',  # JPEG Extended (Process 2 & 4)
+            '1.2.840.10008.1.2.4.57',  # JPEG Lossless, Non-Hierarchical (Process 14)
+            '1.2.840.10008.1.2.4.70',  # JPEG Lossless, Non-Hierarchical, First-Order Prediction
+        ]
+
+        supported_syntaxes = jpeg2000_syntaxes + htj2k_syntaxes + jpeg_syntaxes
+
+        return str(transfer_syntax) in supported_syntaxes
+
+    def _nvimgcodec_decode(self, img, filename):
+        """
+        Decode pixel data using nvImageCodec for supported transfer syntaxes.
+        
+        Args:
+            img: a Pydicom dataset object.
+            filename: the file path of the image.
+            
+        Returns:
+            numpy array: Decoded pixel data.
+            
+        Raises:
+            ValueError: If pixel data is missing or decoding fails.
+        """
+        # Get raw pixel data
+        if not hasattr(img, 'PixelData') or img.PixelData is None:
+            raise ValueError(f"dicom data: {filename} does not have pixel_array.")
+
+        pixel_data = img.PixelData
+
+        # Decode the pixel data
+        # equivalent to data_sequence = pydicom.encaps.decode_data_sequence(pixel_data), which is deprecated
+        data_sequence = [fragment for fragment in pydicom.encaps.generate_fragments(pixel_data) if fragment and fragment != b'\x00\x00\x00\x00']
+        decoded_data = self._nvimgcodec_decoder.decode(data_sequence, params=self.decode_params)
+
+        # Concatenate all images into a volume if number_of_frames > 1 and multiple images are present
+        number_of_frames = getattr(img, 'NumberOfFrames', 1)
+        if number_of_frames > 1 and len(decoded_data) > 1:
+            if number_of_frames != len(decoded_data):
+                raise ValueError(f"Number of frames in the image ({number_of_frames}) does not match the number of decoded images ({len(decoded_data)}).")
+            if self.to_gpu:
+                decoded_array = cp.concatenate([cp.array(d.gpu()) for d in decoded_data], axis=0)
+            else:
+                decoded_array = np.concatenate([np.array(d.cpu()) for d in decoded_data], axis=0)
+        else:
+            if self.to_gpu:
+                decoded_array = cp.array(decoded_data[0].gpu())
+            else:
+                decoded_array = np.array(decoded_data[0].cpu())
+
+        # Reshape based on DICOM parameters
+        rows = getattr(img, 'Rows', None)
+        columns = getattr(img, 'Columns', None)
+        samples_per_pixel = getattr(img, 'SamplesPerPixel', 1)
+        number_of_frames = getattr(img, 'NumberOfFrames', 1)
+
+        if rows and columns:
+            if number_of_frames > 1:
+                expected_shape = (number_of_frames, rows, columns)
+                if samples_per_pixel > 1:
+                    expected_shape = expected_shape + (samples_per_pixel,)
+            else:
+                expected_shape = (rows, columns)
+                if samples_per_pixel > 1:
+                    expected_shape = expected_shape + (samples_per_pixel,)
+
+            # Reshape if necessary
+            if decoded_array.size == np.prod(expected_shape):
+                decoded_array = decoded_array.reshape(expected_shape)
+
+        return decoded_array
+
     def _get_array_data(self, img, filename):
         """
         Get the array data of the image. If `RescaleSlope` and `RescaleIntercept` are available, the raw array data
@@ -964,14 +1084,24 @@ class PydicomReader(ImageReader):
             filename: the file path of the image.
 
         """
+        _nvtx.rangePushA("PydicomReader._get_array_data")
         # process Dicom series
-
-        if self.to_gpu:
-            data = self._get_array_data_from_gpu(img, filename)
+        if self.use_nvimgcodec and self._is_nvimgcodec_supported_syntax(img):
+            try:
+                data = self._nvimgcodec_decode(img, filename)
+            except Exception as e:
+                # Log warning and fallback to pydicom
+                warnings.warn(f"nvImageCodec decoding failed for {filename}: {e}")
+                if not hasattr(img, "pixel_array"):
+                    raise ValueError(f"dicom data: {filename} does not have pixel_array.")
+                data = img.pixel_array
         else:
-            if not hasattr(img, "pixel_array"):
-                raise ValueError(f"dicom data: {filename} does not have pixel_array.")
-            data = img.pixel_array
+            if self.to_gpu:
+                data = self._get_array_data_from_gpu(img, filename)
+            else:
+                if not hasattr(img, "pixel_array"):
+                    raise ValueError(f"dicom data: {filename} does not have pixel_array.")
+                data = img.pixel_array
 
         slope, offset = 1.0, 0.0
         rescale_flag = False
@@ -989,7 +1119,7 @@ class PydicomReader(ImageReader):
                 data = data.astype(cp.float32) * slope + offset
             else:
                 data = data.astype(np.float32) * slope + offset
-
+        _nvtx.rangePop()
         return data
 
 
